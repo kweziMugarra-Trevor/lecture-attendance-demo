@@ -1,0 +1,66 @@
+    try:
+        lecturer = clean(request.form.get('lecturer_ack'), 'Lecturer acknowledgment', 150, False)
+        coordinator = clean(request.form.get('coordinator_ack'), 'Coordinator acknowledgment', 150, False)
+    except ValueError as exc:
+        return redirect(url_for('manage', token=token, sid=sid, error=str(exc)))
+    with db() as con:
+        con.execute('UPDATE sessions SET lecturer_ack=?,coordinator_ack=? WHERE id=?', (lecturer,coordinator,sid))
+    return redirect(url_for('manage', token=token, sid=sid))
+
+
+@app.route('/admin/<token>/session/<sid>/close', methods=['POST'])
+@admin_required
+def close(token, sid):
+    get_session(sid)
+    with db() as con:
+        con.execute("UPDATE sessions SET status='closed' WHERE id=?", (sid,))
+    return redirect(url_for('manage', token=token, sid=sid))
+
+
+@app.route('/admin/<token>/session/<sid>/export.csv')
+@admin_required
+def export(token, sid):
+    s = get_session(sid)
+    with db() as con:
+        students = con.execute('SELECT student_name,student_number,method,submitted_at FROM attendance WHERE session_id=? ORDER BY id', (sid,)).fetchall()
+    out = io.StringIO(newline='')
+    writer = csv.writer(out)
+    headers = ['Programme','Unit','Unit code','Lecturer','Coordinator','Date','Day','Year','Semester','Start time','End time','Lecturer acknowledgment','Coordinator acknowledgment','Student name','Student number','Method','Submitted at']
+    writer.writerow(headers)
+    base = [s['programme'],s['unit'],s['unit_code'],s['lecturer'],s['coordinator'],s['lecture_date'],s['day'],s['lecture_date'][:4],s['semester'],s['start_time'],s['end_time'],s['lecturer_ack'],s['coordinator_ack']]
+    for student in students:
+        writer.writerow([csv_safe(x) for x in base + list(student)])
+    response = make_response('\ufeff' + out.getvalue())
+    response.headers['Content-Type'] = 'text/csv; charset=utf-8'
+    response.headers['Content-Disposition'] = 'attachment; filename="attendance.csv"'
+    return response
+
+
+@app.route('/join/<sid>', methods=['GET','POST'])
+def join(sid):
+    s = get_session(sid)
+    error = None
+    success = False
+    if request.method == 'POST':
+        # Basic per-IP throttling; not a guarantee against distributed guessing.
+        now = time.time()
+        ip = request.remote_addr or 'unknown'
+        queue = attempts[ip]
+        while queue and queue[0] < now - 60:
+            queue.popleft()
+        if len(queue) >= 12:
+            return render_template('join.html', s=s, error='Too many attempts. Wait one minute and try again.', success=False), 429
+        queue.append(now)
+        try:
+            record(sid, request.form.get('student_name'), request.form.get('student_number'), 'phone', request.form.get('pin'))
+            success = True
+        except ValueError as exc:
+            error = str(exc)
+    return render_template('join.html', s=s, error=error, success=success)
+
+
+if __name__ == '__main__':
+    init_db()
+    logging.getLogger('werkzeug').setLevel(logging.ERROR)  # Avoid logging secret URLs.
+    print('\nATTENDANCE DEMO — Keep this admin link private:', flush=True)
+    print(f'http://127.0.0.1:{PORT}/admin/{ADMIN_TOKEN}', flush=True)
