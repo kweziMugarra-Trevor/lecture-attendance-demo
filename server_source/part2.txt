@@ -1,0 +1,74 @@
+        raise ValueError(f'{name} is required and must be at most {limit} characters.' if required else f'{name} must be at most {limit} characters.')
+    return value
+
+
+def get_session(sid):
+    with db() as con:
+        row = con.execute('SELECT * FROM sessions WHERE id=?', (sid,)).fetchone()
+    if row is None:
+        abort(404)
+    return row
+
+
+def code_for(sid, now=None):
+    slot = int((time.time() if now is None else now) // CODE_SECONDS)
+    digest = hmac.new(CODE_KEY, f'{sid}:{slot}'.encode(), hashlib.sha256).digest()
+    return f'{int.from_bytes(digest[:8], "big") % 1000000:06d}'
+
+
+def remaining():
+    return CODE_SECONDS - int(time.time()) % CODE_SECONDS
+
+
+def record(sid, name, number, method, pin=None):
+    name = clean(name, 'Student name', 100)
+    number = clean(number, 'Student number', 60)
+    key = ''.join(number.split()).casefold()
+    if method == 'phone':
+        pin = str(pin or '')
+        if len(pin) != 6 or not pin.isascii() or not pin.isdigit() or not hmac.compare_digest(pin, code_for(sid)):
+            raise ValueError('Invalid or expired code. Ask the coordinator for the current code and try again.')
+    # Check status and insert in one transaction so closing cannot race a submission.
+    with db() as con:
+        con.execute('BEGIN IMMEDIATE')
+        session = con.execute('SELECT status FROM sessions WHERE id=?', (sid,)).fetchone()
+        if not session:
+            abort(404)
+        if session['status'] != 'open':
+            raise ValueError('This session is closed; attendance can no longer be submitted.')
+        try:
+            con.execute('INSERT INTO attendance (session_id,student_name,student_number,number_key,method,submitted_at) VALUES (?,?,?,?,?,?)',
+                        (sid, name, number, key, method, datetime.now().astimezone().isoformat(timespec='seconds')))
+        except sqlite3.IntegrityError:
+            raise ValueError('This student number is already recorded for this session.')
+
+
+def csv_safe(value):
+    text = str(value or '')
+    # Spreadsheet formulas can follow whitespace or control characters.
+    return "'" + text if text.lstrip(' \t\r\n').startswith(('=', '+', '-', '@')) or text.startswith(('\t', '\r', '\n')) else text
+
+
+@app.after_request
+def security_headers(response):
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Content-Security-Policy'] = "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    return response
+
+
+@app.route('/')
+def home():
+    return render_template('home.html')
+
+
+@app.route('/admin/<token>', methods=['GET', 'POST'])
+@admin_required
+def admin(token):
+    error = None
+    if request.method == 'POST':
+        try:
+            fields = {k: clean(request.form.get(k), label, limit) for k, label, limit in [
+                ('programme','Course / programme',120), ('unit','Unit',120), ('unit_code','Unit code',50),
