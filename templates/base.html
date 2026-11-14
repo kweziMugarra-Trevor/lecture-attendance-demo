@@ -1,0 +1,3 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{% block title %}Attendance demo{% endblock %}</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
+<body><header class="top"><div class="wrap brand"><span class="brand-icon">✓</span><span>Lecture<span class="brand-light">Track</span><small>ATTENDANCE DEMO</small></span></div></header><main class="wrap">{% block content %}{% endblock %}</main><footer class="wrap footer">A local classroom demo · Attendance is not proof of physical presence</footer>{% block scripts %}{% endblock %}</body></html>
