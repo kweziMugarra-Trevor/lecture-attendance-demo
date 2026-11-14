@@ -1,0 +1,62 @@
+                ('lecturer','Lecturer',100), ('coordinator','Coordinator',100), ('semester','Semester',50)]}
+            lecture_date = date.fromisoformat(clean(request.form.get('lecture_date'), 'Date', 10))
+            start = datetime.strptime(clean(request.form.get('start_time'), 'Start time', 5), '%H:%M').time()
+            end = datetime.strptime(clean(request.form.get('end_time'), 'End time', 5), '%H:%M').time()
+            if end <= start:
+                raise ValueError('End time must be later than start time on the same day.')
+            sid = secrets.token_urlsafe(18)
+            with db() as con:
+                con.execute('''INSERT INTO sessions (id,programme,unit,unit_code,lecturer,coordinator,lecture_date,day,semester,start_time,end_time,created_at)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''', (sid,fields['programme'],fields['unit'],fields['unit_code'],fields['lecturer'],fields['coordinator'],lecture_date.isoformat(),lecture_date.strftime('%A'),fields['semester'],start.strftime('%H:%M'),end.strftime('%H:%M'),datetime.now().astimezone().isoformat(timespec='seconds')))
+            return redirect(url_for('manage', token=token, sid=sid))
+        except ValueError as exc:
+            error = str(exc) or 'Please check the date and times.'
+    with db() as con:
+        sessions = con.execute('SELECT * FROM sessions ORDER BY rowid DESC LIMIT 200').fetchall()
+    return render_template('admin.html', token=token, sessions=sessions, error=error, today=date.today().isoformat(), lan=LAN_IP)
+
+
+@app.route('/admin/<token>/session/<sid>')
+@admin_required
+def manage(token, sid):
+    session = get_session(sid)
+    with db() as con:
+        students = con.execute('SELECT * FROM attendance WHERE session_id=? ORDER BY id', (sid,)).fetchall()
+    link = f'http://{LAN_IP}:{PORT}/join/{sid}' if LAN_IP else None
+    return render_template('manage.html', token=token, s=session, students=students, link=link, code=code_for(sid), seconds=remaining(), error=request.args.get('error'))
+
+
+@app.route('/admin/<token>/session/<sid>/code')
+@admin_required
+def current_code(token, sid):
+    s = get_session(sid)
+    return {'code': code_for(sid) if s['status'] == 'open' else None, 'seconds': remaining(), 'status': s['status']}
+
+
+@app.route('/admin/<token>/session/<sid>/qr.png')
+@admin_required
+def qr(token, sid):
+    get_session(sid)
+    if not LAN_IP:
+        abort(503, description='Set ATTENDANCE_HOST to your laptop LAN IPv4 address and restart.')
+    img = qrcode.make(f'http://{LAN_IP}:{PORT}/join/{sid}')
+    data = io.BytesIO()
+    img.save(data, format='PNG')
+    data.seek(0)
+    return send_file(data, mimetype='image/png')
+
+
+@app.route('/admin/<token>/session/<sid>/manual', methods=['POST'])
+@admin_required
+def manual(token, sid):
+    try:
+        record(sid, request.form.get('student_name'), request.form.get('student_number'), 'manual')
+        return redirect(url_for('manage', token=token, sid=sid))
+    except ValueError as exc:
+        return redirect(url_for('manage', token=token, sid=sid, error=str(exc)))
+
+
+@app.route('/admin/<token>/session/<sid>/ack', methods=['POST'])
+@admin_required
+def acknowledgement(token, sid):
+    get_session(sid)
