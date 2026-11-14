@@ -1,0 +1,93 @@
+import csv
+import hashlib
+import hmac
+import io
+import ipaddress
+import logging
+import os
+import secrets
+import socket
+import sqlite3
+import time
+from collections import defaultdict, deque
+from datetime import date, datetime
+from functools import wraps
+
+import qrcode
+from flask import Flask, abort, make_response, redirect, render_template, request, send_file, url_for
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024
+BASE = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get('ATTENDANCE_DB', os.path.join(BASE, 'attendance.sqlite3'))
+PORT = int(os.environ.get('ATTENDANCE_PORT', '5000'))
+ADMIN_TOKEN = secrets.token_urlsafe(32)  # New on every start; never saved in database.
+CODE_KEY = secrets.token_bytes(32)
+CODE_SECONDS = 60
+attempts = defaultdict(deque)
+
+
+def lan_address():
+    configured = os.environ.get('ATTENDANCE_HOST', '').strip()
+    if configured:
+        try:
+            addr = ipaddress.ip_address(configured)
+            if addr.version != 4 or addr.is_loopback or addr.is_unspecified:
+                raise ValueError()
+            return str(addr)
+        except ValueError:
+            raise SystemExit('ATTENDANCE_HOST must be the laptop’s LAN IPv4 address, not 127.0.0.1 or 0.0.0.0.')
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(('192.0.2.1', 80))  # Determines route locally; no data is sent.
+            ip = sock.getsockname()[0]
+        finally:
+            sock.close()
+        if not ip.startswith('127.'):
+            return ip
+    except OSError:
+        pass
+    return None
+
+LAN_IP = lan_address()
+
+
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=10)
+    con.row_factory = sqlite3.Row
+    con.execute('PRAGMA foreign_keys=ON')
+    return con
+
+
+def init_db():
+    with db() as con:
+        con.executescript('''
+        CREATE TABLE IF NOT EXISTS sessions (
+          id TEXT PRIMARY KEY, programme TEXT NOT NULL, unit TEXT NOT NULL, unit_code TEXT NOT NULL,
+          lecturer TEXT NOT NULL, coordinator TEXT NOT NULL, lecture_date TEXT NOT NULL,
+          day TEXT NOT NULL, semester TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+          lecturer_ack TEXT NOT NULL DEFAULT '', coordinator_ack TEXT NOT NULL DEFAULT '',
+          status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS attendance (
+          id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
+          student_name TEXT NOT NULL, student_number TEXT NOT NULL, number_key TEXT NOT NULL,
+          method TEXT NOT NULL, submitted_at TEXT NOT NULL,
+          UNIQUE(session_id, number_key)
+        );
+        ''')
+
+
+def admin_required(fn):
+    @wraps(fn)
+    def wrapped(token, *args, **kwargs):
+        if not hmac.compare_digest(token, ADMIN_TOKEN):
+            abort(404)
+        return fn(token, *args, **kwargs)
+    return wrapped
+
+
+def clean(value, name, limit, required=True):
+    value = ' '.join((value or '').split())
+    if any(ord(c) < 32 or ord(c) == 127 for c in value) or len(value) > limit or (required and not value):
